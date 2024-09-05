@@ -33,6 +33,7 @@ contract CrossChainNFT is ONFT721 {
     }
 
     function createNFT(string memory tokenURI, address to) public onlyChatBotContract {
-        // TODO: LayerZero currently, use ChainLink CCIP if LayerZero cant support
+        // TODO: LayerZero
+        // Currently making an extension at LayerZero to enable this functionality for the project
     }
 }
