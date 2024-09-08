@@ -5,18 +5,25 @@ pragma solidity ^0.8.22;
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { OApp, MessagingFee, Origin } from "@layerzerolabs/lz-evm-oapp-v2/contracts/oapp/OApp.sol";
 import { MessagingReceipt } from "@layerzerolabs/lz-evm-oapp-v2/contracts/oapp/OAppSender.sol";
+import { OptionsBuilder } from "@layerzerolabs/oapp-evm/contracts/oapp/libs/OptionsBuilder.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
+
 
 struct Bid {
     address payable bidder;
-    uint amount; // in Gwei
-    address bridge; // address of the bridge contract for that chain
-    address lzEndpoint; // LayerZero endpoint of the chain of the bidder
+    uint256 amount; // in Gwei
+    uint32 lzEndpoint; // LayerZero endpoint of the chain of the bidder
 }
+
+// Types of messages that a contract will receive are :
+    // 1. Bid submission
+    // 2. Successful bid selection
+    // 3. Minting of a token on a chain
 
 enum MessageType {
     Bid_Submission, // 0
-    Bid_Selection // 1
+    Bid_Selection, // 1
+    Token_Mint // 2
 }
 
 struct CrossChainMessage {
@@ -27,46 +34,109 @@ struct CrossChainMessage {
 contract MyOApp is OApp, ERC721URIStorage {
 
     // store bids for the tokens currently on this chain
-    mapping (uint256=>Bid[]) bids;
+    mapping (uint256=>Bid[]) public bids;
     // store bids that have been submitted from this chain and are in process
-    mapping (uint256=>Bid[]) extBids;
+    mapping (uint256=>Bid[]) public extBids;
     // store the tokenURIs for all tokens that have ever been minted
-    mapping (uint256=>string) allTokenURIs;
+    mapping (uint256=>string) public allTokenURIs;
+    // store the bridge endpoints, mapped usign the lz endpoint addresses
+    mapping (address=>address) public bridgeMapping;
+    // store information about chain currently having some token
+    mapping (uint256=>uint32) public tokenIdToLzEndpoint;
 
-    constructor(address _endpoint, address _delegate) 
-        OApp(_endpoint, _delegate) Ownable(_delegate) ERC721("crossAINFT", "CNFT") {}
+    uint32 public  eid;
+    address public  chatbotAddress;
+    // to have same tokenId minted across the chains for the same NFT, we give a part of the 
+    // tokenId range that we have to each contract on each chain
+    uint256 public startIdx;
+    uint256 public endIdx;
+    uint256 public tokenCounter;
+    uint32[] eids;
 
-    // Types of messages that a contract will receive are :
-    // 1. Bid submission
-    // 2. Successful bid selection
+    constructor(address _endpoint, address _delegate, address _chatbotAddress, uint256 _startIdx, uint256 _endIdx, uint32 _eid) 
+        OApp(_endpoint, _delegate) Ownable(_delegate) ERC721("crossAINFT", "CNFT") {
+            chatbotAddress = _chatbotAddress;
+            startIdx=_startIdx;
+            endIdx=_endIdx;
+            tokenCounter=0;
+            eid=_eid;
+        }
+    
+    function addPeerEid(uint32 _eid, address contractAddress) external onlyOwner {
+        _setPeer(_eid, bytes32(abi.encodePacked(contractAddress)));
+        eids.push(_eid);
+    }
+
+    function changeChatbotAddress(address newChatbotAddress) external onlyOwner {
+        chatbotAddress = newChatbotAddress;
+    }
+
+    function createNFT(string calldata tokenURI, address owner) external payable {
+        // require(msg.sender == chatbotAddress, "Wrong address");
+        uint256 tokenId = tokenCounter + startIdx;
+        _mint(owner, tokenId);
+        _setTokenURI(tokenId, tokenURI);
+        tokenCounter++;
+        uint l = eids.length;
+        bytes memory msgPayload = abi.encode(MessageType.Token_Mint, tokenId, abi.encode(tokenURI));
+        for (uint idx = 0; idx < l; idx++){
+            _lzSend(eids[idx], msgPayload, bytes(""), MessagingFee(msg.value, 0), payable(msg.sender));
+        }
+    }
+
+    function setBridge(address _destChainLzEndpoint, address _bridgeAddress) public onlyOwner {
+        bridgeMapping[_destChainLzEndpoint] = _bridgeAddress;
+    }
+
+    function _putBid() internal returns (uint tokenId, Bid memory) {
+        uint amount = msg.value;
+        address payable bidder = payable (msg.sender);
+        tokenId = abi.decode(msg.data, (uint256));
+        Bid memory bid = Bid(bidder, amount, eid);
+        extBids[tokenId].push(bid);
+        return (tokenId, bid);
+    }
+
+    function _sendBidToNFTChainContract(Bid memory bid, uint256 tokenId) internal {
+        bytes memory encodedBid = abi.encode(bid);
+        bytes memory msgPayload = abi.encode(MessageType.Bid_Submission, tokenId, encodedBid);
+        _lzSend(tokenIdToLzEndpoint[tokenId], msgPayload, bytes(""), MessagingFee(msg.value, 0), payable(msg.sender));
+    }
+
+    function _processBid() internal {
+        (uint tokenId, Bid memory bid) = _putBid();        
+        // send bid to the chain having this token
+        _sendBidToNFTChainContract(bid, tokenId);
+    }
 
     receive() external payable {
-        // decode the data
+        // money will only be received when a bid has to be submitted
+        _processBid();
     }
 
-    function makeBid(uint amount, uint tokenId) payable external {
-
+    function makeBid(uint _tokenId) external payable {
+        uint amount = msg.value;
+        address payable bidder = payable (msg.sender);
+        Bid memory bid = Bid(bidder, amount, eid);
+        extBids[_tokenId].push(bid);
+        _sendBidToNFTChainContract(bid, _tokenId);
     }
 
-    function crossChainNFTTranser(uint256 tokenID, address recipient) external {}
+    // tell if the msg sender's bid has been successfully placed
+    function confirmBid(uint256 _tokenId, uint256 amount) external view returns (bool) {
+        uint l = extBids[_tokenId].length;
+        address payable payableAddress = payable(msg.sender);
+        for(uint idx = 0; idx < l; idx++){
+            if (extBids[_tokenId][idx].bidder == payableAddress && extBids[_tokenId][idx].amount == amount){
+                return true;
+            }
+        }
+        return false;
+    }
 
-    function sameChainNFTTransfer() external {}
-
-    /**
-     * @notice Sends a message from the source chain to a destination chain.
-     * @param _dstEid The endpoint ID of the destination chain.
-     * @param _message The message string to be sent.
-     * @param _options Additional options for message execution.
-     * @dev Encodes the message as bytes and sends it using the `_lzSend` internal function.
-     * @return receipt A `MessagingReceipt` struct containing details of the message sent.
-     */
-    function send(
-        uint32 _dstEid,
-        string memory _message,
-        bytes calldata _options
-    ) external payable returns (MessagingReceipt memory receipt) {
-        bytes memory _payload = abi.encode(_message);
-        receipt = _lzSend(_dstEid, _payload, _options, MessagingFee(msg.value, 0), payable(msg.sender));
+    // get bids for a specific token (to be executed for a token on the caller's chain only)
+    function getBidsByTokenId(uint256 _tokenId) external view returns (Bid[] memory) {
+        return bids[_tokenId];
     }
 
     /**
@@ -97,6 +167,15 @@ contract MyOApp is OApp, ERC721URIStorage {
         }
     }
 
+    function _sendBackMoneyOfAllBids(uint _tokenId) internal {
+        Bid[] memory allBids = extBids[_tokenId];
+        uint l = allBids.length;
+        for(uint i=0;i<l;i++){
+                allBids[i].bidder.transfer(allBids[i].amount);
+        }
+    }
+
+
     /**
      * @dev Internal function override to handle incoming messages from another chain.
      * @dev _origin A struct containing information about the message sender.
@@ -110,7 +189,7 @@ contract MyOApp is OApp, ERC721URIStorage {
      * Decodes the received payload and processes it as per the business logic defined in the function.
      */
     function _lzReceive(
-        Origin calldata /*_origin*/,
+        Origin calldata origin,
         bytes32 /*_guid*/,
         bytes calldata payload,
         address /*_executor*/,
@@ -124,16 +203,30 @@ contract MyOApp is OApp, ERC721URIStorage {
         }
         else if (msgType == MessageType.Bid_Selection) {
             Bid memory bid = abi.decode(data, (Bid));
-            // humare yaha ka bacha select ho gya yaya
             // mint krdo, pesa transfer karwado
             // TODO: bridge the money
             // money will be transferred, now minting
-            address payable selectedBidderAddress = bid.bidder;
-            _mint(selectedBidderAddress, _tokenId);
-            _setTokenURI(_tokenId, allTokenURIs[_tokenId]);
-            // send back money of the other bidders
-            _sendBackMoneyOfBids(selectedBidderAddress, _tokenId);
-            delete extBids[_tokenId];
+            if (bid.lzEndpoint == eid) {
+                // current chain's bid has been selected
+                address payable selectedBidderAddress = bid.bidder;
+                _mint(selectedBidderAddress, _tokenId);
+                _setTokenURI(_tokenId, allTokenURIs[_tokenId]);
+                // send back money of the other bidders
+                _sendBackMoneyOfBids(selectedBidderAddress, _tokenId);
+                delete extBids[_tokenId];
+                tokenIdToLzEndpoint[_tokenId] = eid;
+            }
+            else {
+                _sendBackMoneyOfAllBids(_tokenId);
+                delete extBids[_tokenId];
+                tokenIdToLzEndpoint[_tokenId] = bid.lzEndpoint;
+            }
+        } else if (msgType == MessageType.Token_Mint) {
+            // decode the tokenid and the tokenURI and set it
+            // srcEid is contained in origin
+            string memory tokenURI = abi.decode(data, (string));
+            allTokenURIs[_tokenId] = tokenURI;
+            tokenIdToLzEndpoint[_tokenId] = origin.srcEid;
         }
     }
 
